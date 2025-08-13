@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Playground Hex Cross-panel Connection</title>
+  <script src="js/d3.v7.min.js"></script>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0; padding: 0;
+      box-sizing: border-box;
+      overflow: hidden;
+    }
+    #outer-container {
+      width: 90vw;
+      height: 100vh;
+      margin: 0 auto;
+      padding: 0;
+      position: relative;
+      background: #eee;
+      overflow: hidden;
+    }
+    #playground {
+      width: 100%;
+      height: 100%;
+      position: relative;
+      margin: 0;
+      padding: 32px;
+      background: #fff;
+      /* border: 2px solid #bbb; */
+      box-sizing: border-box;
+      overflow: visible;
+    }
+    .subspace {
+      position: absolute;
+      min-width: 360px;
+      min-height: 400px;
+      max-width: 1000px;
+      max-height: 1000px;
+      left: 0; top: 0;
+      resize: both;
+      overflow: auto;
+      background: #fff;
+      border: 1.5px solid #aaa;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px #0001;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: flex-start;
+      user-select: none;
+      z-index: 1;
+    }
+    .subspace-title {
+      cursor: move;
+      font-size: 14px;
+      color: #666;
+      text-align: center;
+      margin: 10px 0 4px 0;
+      pointer-events: auto;
+      user-select: none;
+      position: relative;
+      z-index: 20;
+    }
+    .hex-container {
+      position: relative;
+      width: 100%; height: 92%;
+      flex: 1;
+    }
+    .hex-svg {
+      position: absolute;
+      left: 0; top: 0;
+      width: 100%; height: 100%;
+      display: block;
+      overflow: visible;
+      z-index: 1;
+    }
+    .overlay-svg {
+      position: absolute;
+      left: 0; top: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 2;
+    }
+    #global-overlay {
+      position: absolute;
+      left: 0; top: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 100;
+    }
+  </style>
+</head>
+<body>
+  <div id="outer-container">
+    <div id="playground">
+      <svg id="global-overlay"></svg>
+    </div>
+  </div>
+<script>
+// ========================
+// 全局 App 配置与状态集中管理
+// ========================
+const App = {
+  config: {
+    // 核心可视参数和样式
+    hex: {
+      radius: 22,
+      fillOpacity: 0.5,
+      borderWidth: 1,
+      borderColor: "#fff",
+      textFill: "#a9d08d",
+      imageFill: "#a6cee3",
+      zIndex: 1,
+    },
+    city: {
+      radius: 5,
+      borderWidth: 1.5,
+      fill: "#fff",
+      borderColor: "#777",
+      zIndex: 3,
+    },
+    flight: {
+      color: "#4a5f7e",
+      width: 2.2,
+      opacity: 0.98,
+      dash: "6,4",
+      hoverWidth: 3,
+      hoverOpacity: 1.0,
+      tempWidth: 2,
+      tempOpacity: 0.55,
+      tempDash: "8,6",
+      zIndex: 100,
+      controlCurveRatio: 0.18,
+    },
+    road: {
+      color: "#e9c46b",
+      width: 1.5,
+      opacity: 0.88,
+      dash: null,
+      zIndex: 2,
+    },
+    river: {
+      color: "#a6cee3",
+      width: 1.5,
+      opacity: 0.88,
+      dash: null,
+      zIndex: 2,
+    },
+    countryBorder: {
+      color: "#000",
+      width: 2,
+    },
+    background: "#fff",
+    playground: {
+      padding: 32,
+    }
+  },
+  // 运行时状态变量
+  subspaceSvgs: [],
+  overlaySvgs: [],
+  hexMapsByPanel: [],
+  allHexDataByPanel: [],
+  zoomStates: [],
+  customFlightBuffer: [],
+  isDrawingFlight: false,
+  currentMouse: {x: 0, y: 0},
+  _lastLinks: [],
+  get playground() { return document.getElementById('playground'); },
+  get globalOverlay() { return document.getElementById('global-overlay'); }
+};
+
+// ========================
+// 工具函数
+// ========================
+function getHexFillColor(d) {
+  if (d.modality === 'text') return App.config.hex.textFill;
+  if (d.modality === 'image') return App.config.hex.imageFill;
+  return App.config.background;
+}
+function extractCityHexSet(links) {
+  const citySet = {};
+  links.forEach(link => {
+    if (!link.path || link.path.length < 2) return;
+    let p = link.path[0];
+    let panelIdx = p.panelIdx ?? link.panelIdx ?? link.panelIdxFrom ?? 0;
+    citySet[`${panelIdx}_${p.q}_${p.r}`] = true;
+  });
+  if (App.isDrawingFlight && App.customFlightBuffer.length === 1) {
+    let a = App.customFlightBuffer[0];
+    citySet[`${a.panelIdx}_${a.q}_${a.r}`] = true;
+  }
+  return citySet;
+}
+function hexPoints(radius) {
+  const angle = Math.PI / 3;
+  return d3.range(6).map(i => [
+    radius * Math.cos(angle * i),
+    radius * Math.sin(angle * i)
+  ]).concat([[radius, 0]]);
+}
+function getPanelRect(panelIdx) {
+  const panelDom = document.querySelectorAll('.subspace')[panelIdx];
+  if (!panelDom) return null;
+  const container = panelDom.querySelector('.hex-container');
+  if (!container) return null;
+  const playgroundRect = App.playground.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  return {
+    left: containerRect.left - playgroundRect.left,
+    top: containerRect.top - playgroundRect.top,
+    right: containerRect.right - playgroundRect.left,
+    bottom: containerRect.bottom - playgroundRect.top
+  };
+}
+function pointInRect(x, y, rect) {
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+function getHexGlobalXY(panelIdx, q, r) {
+  const hexMap = App.hexMapsByPanel[panelIdx];
+  if (!hexMap) return null;
+  const hex = hexMap.get(`${q},${r}`);
+  if (!hex) return null;
+  const panelDom = document.querySelectorAll('.subspace')[panelIdx];
+  const container = panelDom.querySelector('.hex-container');
+  const playgroundRect = App.playground.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  const offsetX = containerRect.left - playgroundRect.left;
+  const offsetY = containerRect.top - playgroundRect.top;
+  const t = App.zoomStates[panelIdx] || d3.zoomIdentity;
+  const [tx, ty] = [t.applyX(hex.x), t.applyY(hex.y)];
+  return [tx + offsetX, ty + offsetY];
+}
+
+// ========================
+// 渲染函数
+// ========================
+function renderPanels(subspaces) {
+  const playground = App.playground;
+  Array.from(playground.querySelectorAll('.subspace')).forEach(el => el.remove());
+  App.subspaceSvgs = [];
+  App.overlaySvgs = [];
+  App.hexMapsByPanel = [];
+  App.allHexDataByPanel = [];
+  App.zoomStates = [];
+
+  let defaultLeft = 30, defaultTop = 30, offset = 380, rowOffset = 280;
+  subspaces.forEach((space, i) => {
+    const div = document.createElement('div');
+    div.className = 'subspace';
+    div.style.position = 'absolute';
+    div.style.left = (defaultLeft + offset * (i % 3)) + 'px';
+    div.style.top = (defaultTop + rowOffset * Math.floor(i / 3)) + 'px';
+    div.style.resize = "both";
+    div.style.overflow = "hidden";
+
+    const title = document.createElement('div');
+    title.className = 'subspace-title';
+    title.innerText = space.subspaceName || `Subspace ${i + 1}`;
+    div.appendChild(title);
+
+    const container = document.createElement('div');
+    container.className = 'hex-container';
+    container.style.position = "relative";
+    container.style.width = "100%";
+    container.style.height = "92%";
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute('class', 'hex-svg');
+    container.appendChild(svg);
+
+    const overlay = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    overlay.setAttribute('class', 'overlay-svg');
+    overlay.style.pointerEvents = "none";
+    overlay.style.zIndex = App.config.road.zIndex;
+    container.appendChild(overlay);
+
+    const overlayD3 = d3.select(overlay);
+    if (overlayD3.select("g").empty()) overlayD3.append("g");
+
+    div.appendChild(container);
+    playground.appendChild(div);
+    App.subspaceSvgs.push(d3.select(svg));
+    App.overlaySvgs.push(overlayD3);
+
+    enableSubspaceDrag(div, i);
+  });
+}
+
+function renderHexGridFromData(panelIdx, space, hexRadius) {
+  const svg = App.subspaceSvgs[panelIdx];
+  const overlay = App.overlaySvgs[panelIdx];
+  const width = svg.node().clientWidth || svg.node().parentNode.clientWidth;
+  const height = svg.node().clientHeight || svg.node().parentNode.clientHeight;
+  svg.attr("width", width).attr("height", height);
+  overlay.attr("width", width).attr("height", height);
+
+  let container = svg.select("g");
+  if (container.empty()) container = svg.append("g");
+  let overlayG = overlay.select("g");
+  if (overlayG.empty()) overlayG = overlay.append("g");
+
+  const rawHexList = (space.hexList || []).map(h => {
+    const x = 3/4 * 2 * hexRadius * h.q;
+    const y = Math.sqrt(3) * hexRadius * (h.r + h.q / 2);
+    return { ...h, rawX: x, rawY: y };
+  });
+  const xs = rawHexList.map(h => h.rawX), ys = rawHexList.map(h => h.rawY);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const centerX = (minX + maxX) / 2, centerY = (minY + maxY) / 2;
+  const hexList = rawHexList.map(h => ({
+    ...h,
+    x: h.rawX - centerX + width / 2,
+    y: h.rawY - centerY + height / 2,
+    panelIdx
+  }));
+  App.allHexDataByPanel[panelIdx] = hexList;
+
+  let lastTransform = App.zoomStates[panelIdx] || d3.zoomIdentity;
+  const zoom = d3.zoom()
+    .scaleExtent([0.6, 2])
+    .on("zoom", (event) => {
+      container.attr("transform", event.transform);
+      overlayG.attr("transform", event.transform);
+      App.zoomStates[panelIdx] = event.transform;
+      if (App._lastLinks) {
+        drawOverlayLinesFromLinks(App._lastLinks, App.allHexDataByPanel, App.hexMapsByPanel, App.isDrawingFlight);
+        renderCityCircles(extractCityHexSet(App._lastLinks), App.allHexDataByPanel, App.config.city.radius);
+      }
+    });
+  svg.call(zoom).on("dblclick.zoom", null);
+  container.attr("transform", lastTransform);
+  overlayG.attr("transform", lastTransform);
+  svg.call(zoom.transform, lastTransform);
+
+  container.selectAll("g.hex")
+    .data(hexList, d => `${d.panelIdx}_${d.q}_${d.r}`)
+    .join(
+      enter => {
+        const g = enter.append("g").attr("class", "hex");
+        g.append("path")
+          .attr("d", d3.line()(hexPoints(hexRadius)))
+          .attr("fill", d => getHexFillColor(d))
+          .attr("fill-opacity", App.config.hex.fillOpacity)
+          .attr("stroke", App.config.hex.borderColor)
+          .attr("stroke-width", App.config.hex.borderWidth);
+        g.on("click", function(event, d) { onHexClick(panelIdx, d.q, d.r, this); });
+        g.on("dblclick", function(event, d) { onHexDblClick(panelIdx, d.q, d.r, this); });
+        return g.attr("transform", d => `translate(${d.x},${d.y})`);
+      },
+      update => update.attr("transform", d => `translate(${d.x},${d.y})`),
+      exit => exit.remove()
+    );
+
+  container.selectAll(".country-border").remove();
+  (space.countries || []).forEach(country => {
+    let hexListCountry = [];
+    container.selectAll("g.hex").each(function(d) {
+      if (country.hexes.some(hx => hx.q === d.q && hx.r === d.r)) {
+        hexListCountry.push({...d});
+      }
+    });
+    if (hexListCountry.length > 0) {
+      drawCountryBorder(hexListCountry, svg, App.config.hex.radius, App.config.countryBorder.color, App.config.countryBorder.width);
+    }
+  });
+
+  let hexMap = new Map();
+  hexList.forEach(d => hexMap.set(`${d.q},${d.r}`, d));
+  App.hexMapsByPanel[panelIdx] = hexMap;
+}
+
+function renderCityCircles(cityHexSet, allHexDataByPanel, cityRadius) {
+  App.overlaySvgs.forEach((overlaySvg, panelIdx) => {
+    const g = overlaySvg.select("g");
+    let cityHexes = allHexDataByPanel[panelIdx]?.filter(
+      h => cityHexSet[`${panelIdx}_${h.q}_${h.r}`]
+    ) || [];
+    const circles = g.selectAll("circle.city-circle")
+      .data(cityHexes, d => `${d.q},${d.r}`);
+    circles.enter()
+      .append("circle")
+      .attr("class", "city-circle")
+      .attr("cx", d => d.x)
+      .attr("cy", d => d.y)
+      .attr("r", cityRadius)
+      .attr("fill", App.config.city.fill)
+      .attr("stroke", App.config.city.borderColor)
+      .attr("stroke-width", App.config.city.borderWidth)
+      .style("pointer-events", "auto");
+    circles
+      .attr("cx", d => d.x)
+      .attr("cy", d => d.y)
+      .attr("r", cityRadius);
+    circles.exit().remove();
+    g.selectAll("circle.city-circle").raise();
+  });
+}
+
+function drawOverlayLinesFromLinks(links, allHexDataByPanel, hexMapsByPanel, showTempFlight=false) {
+  App.overlaySvgs.forEach(overlaySvg => overlaySvg.select("g").selectAll("polyline, line, path").remove());
+  d3.select("#global-overlay").selectAll("polyline, line, path").remove();
+
+  links.forEach(link => {
+    if (link.type === "flight") {
+      const style = App.config.flight;
+      const points = link.path.map((p, i) => {
+        let panelIdx = p.panelIdx ?? (i === 0 ? link.panelIdxFrom : link.panelIdxTo) ?? link.panelIdx ?? 0;
+        return getHexGlobalXY(panelIdx, p.q, p.r);
+      }).filter(Boolean);
+
+      const allRects = link.path.map((p, i) => {
+        let panelIdx = p.panelIdx ?? (i === 0 ? link.panelIdxFrom : link.panelIdxTo) ?? link.panelIdx ?? 0;
+        return getPanelRect(panelIdx);
+      });
+      const allInRect = points.every((pt, i) => pt && pointInRect(pt[0], pt[1], allRects[i]));
+      if (!allInRect) return;
+
+      if (points.length === 2) {
+        const [p0, p1] = points;
+        const dx = p1[0] - p0[0];
+        const dy = p1[1] - p0[1];
+        const mx = (p0[0] + p1[0]) / 2;
+        const my = (p0[1] + p1[1]) / 2;
+        const curveOffset = Math.sign(dx) * style.controlCurveRatio * Math.sqrt(dx*dx + dy*dy);
+        const c1x = mx + curveOffset;
+        const c1y = my - curveOffset;
+        d3.select("#global-overlay").append("path")
+          .attr("d", `M${p0[0]},${p0[1]} Q${c1x},${c1y} ${p1[0]},${p1[1]}`)
+          .attr("stroke", style.color)
+          .attr("stroke-width", style.width)
+          .attr("stroke-opacity", style.opacity)
+          .attr("fill", "none")
+          .attr("stroke-dasharray", style.dash || null);
+      }
+    } else {
+      // road/river
+      const style = App.config[link.type] || App.config.road;
+      let panelIdx = link.panelIdx ?? (link.path && link.path[0].panelIdx) ?? 0;
+      const overlaySvg = App.overlaySvgs[panelIdx];
+      const g = overlaySvg.select("g");
+      const hexMap = App.hexMapsByPanel[panelIdx];
+      const points = link.path.map(p => {
+        let hex = hexMap && hexMap.get(`${p.q},${p.r}`);
+        return hex ? [hex.x, hex.y] : null;
+      }).filter(Boolean);
+      if (points.length < 2) return;
+      if (points.length === 2) {
+        g.append("line")
+          .attr("x1", points[0][0])
+          .attr("y1", points[0][1])
+          .attr("x2", points[1][0])
+          .attr("y2", points[1][1])
+          .attr("stroke", style.color)
+          .attr("stroke-width", style.width)
+          .attr("stroke-opacity", style.opacity)
+          .attr("fill", "none")
+          .attr("stroke-dasharray", style.dash || null);
+      } else {
+        g.append("polyline")
+          .attr("points", points.map(p => p.join(",")).join(" "))
+          .attr("stroke", style.color)
+          .attr("stroke-width", style.width)
+          .attr("stroke-opacity", style.opacity)
+          .attr("fill", "none")
+          .attr("stroke-dasharray", style.dash || null);
+      }
+    }
+  });
+
+  App.overlaySvgs.forEach(overlaySvg => {
+    const g = overlaySvg.select("g");
+    g.selectAll("circle.city-circle").raise();
+  });
+
+  // 悬浮flight虚线
+  if (showTempFlight && App.isDrawingFlight && App.customFlightBuffer.length === 1) {
+    let a = App.customFlightBuffer[0];
+    let p0 = getHexGlobalXY(a.panelIdx, a.q, a.r);
+    let p1 = [App.currentMouse.x, App.currentMouse.y];
+    if (p0 && p1) {
+      const tempStyle = App.config.flight;
+      const dx = p1[0] - p0[0], dy = p1[1] - p0[1];
+      const mx = (p0[0] + p1[0]) / 2, my = (p0[1] + p1[1]) / 2;
+      const curveOffset = Math.sign(dx) * tempStyle.controlCurveRatio * Math.sqrt(dx*dx + dy*dy);
+      const c1x = mx + curveOffset, c1y = my - curveOffset;
+      d3.select("#global-overlay").append("path")
+        .attr("d", `M${p0[0]},${p0[1]} Q${c1x},${c1y} ${p1[0]},${p1[1]}`)
+        .attr("stroke", tempStyle.color)
+        .attr("stroke-width", tempStyle.tempWidth)
+        .attr("stroke-opacity", tempStyle.tempOpacity)
+        .attr("fill", "none")
+        .attr("stroke-dasharray", tempStyle.tempDash);
+    }
+  }
+}
+
+function drawCountryBorder(hexList, svg, hexRadius, color, strokeWidth) {
+  const keySet = new Set(hexList.map(h => `${h.panelIdx}_${h.q}_${h.r}`));
+  const dirs = [
+    [+1,  0], [0, +1], [-1, +1],
+    [-1,  0], [0, -1], [+1, -1]
+  ];
+  const hexPoint = i => {
+    const angle = Math.PI/3 * i;
+    return [hexRadius * Math.cos(angle), hexRadius * Math.sin(angle)];
+  };
+  let borderEdges = [];
+  hexList.forEach(h => {
+    const cx = h.x, cy = h.y;
+    dirs.forEach(([dq, dr], i) => {
+      const nKey = `${h.panelIdx}_${h.q+dq}_${h.r+dr}`;
+      if (!keySet.has(nKey)) {
+        const p1 = hexPoint(i);
+        const p2 = hexPoint((i+1)%6);
+        borderEdges.push([[cx+p1[0], cy+p1[1]], [cx+p2[0], cy+p2[1]]]);
+      }
+    });
+  });
+  const edgeKey = (a, b) => a[0]+','+a[1]+'_'+b[0]+','+b[1];
+  const uniq = {};
+  borderEdges.forEach(([a,b]) => {
+    const k1 = edgeKey(a,b), k2 = edgeKey(b,a);
+    if (!uniq[k1] && !uniq[k2]) uniq[k1]=[a,b];
+  });
+  const container = svg.select("g");
+  Object.values(uniq).forEach(([a,b]) => {
+    container.append("line")
+      .attr("class", "country-border")
+      .attr("x1", a[0]).attr("y1", a[1])
+      .attr("x2", b[0]).attr("y2", b[1])
+      .attr("stroke", color)
+      .attr("stroke-width", strokeWidth)
+      .attr("pointer-events", "none");
+  });
+}
+
+
+// ========================
+// 拖拽、缩放、Resize
+// ========================
+function enableSubspaceDrag(subspaceDiv, idx) {
+  const title = subspaceDiv.querySelector('.subspace-title');
+  let startX, startY, origLeft, origTop;
+  let isDragging = false;
+  title.addEventListener('mousedown', function(e) {
+    isDragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    origLeft = parseInt(subspaceDiv.style.left || 0);
+    origTop = parseInt(subspaceDiv.style.top || 0);
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', function(e) {
+    if (!isDragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    subspaceDiv.style.left = (origLeft + dx) + "px";
+    subspaceDiv.style.top = (origTop + dy) + "px";
+    requestAnimationFrame(() => {
+      drawOverlayLinesFromLinks(App._lastLinks, App.allHexDataByPanel, App.hexMapsByPanel, App.isDrawingFlight);
+      renderCityCircles(extractCityHexSet(App._lastLinks), App.allHexDataByPanel, App.config.city.radius);
+    });
+  });
+  document.addEventListener('mouseup', function(e) {
+    if (isDragging) {
+      isDragging = false;
+      document.body.style.userSelect = "";
+    }
+  });
+}
+function observePanelResize() {
+  document.querySelectorAll('.subspace').forEach((subspaceDiv, i) => {
+    if (!subspaceDiv._resizeObserver) {
+      subspaceDiv._resizeObserver = new ResizeObserver(() => {
+        const svg = subspaceDiv.querySelector('svg.hex-svg');
+        const overlay = subspaceDiv.querySelector('svg.overlay-svg');
+        const width = subspaceDiv.clientWidth;
+        const height = subspaceDiv.clientHeight * 0.92;
+        if(svg) svg.setAttribute('width', width);
+        if(svg) svg.setAttribute('height', height);
+        if(overlay) overlay.setAttribute('width', width);
+        if(overlay) overlay.setAttribute('height', height);
+        if(App._lastLinks)
+          drawOverlayLinesFromLinks(App._lastLinks, App.allHexDataByPanel, App.hexMapsByPanel, App.isDrawingFlight);
+        if(App._lastLinks)
+          renderCityCircles(extractCityHexSet(App._lastLinks), App.allHexDataByPanel, App.config.city.radius);
+      });
+      subspaceDiv._resizeObserver.observe(subspaceDiv);
+    }
+  });
+}
+
+// ========================
+// 交互和数据
+// ========================
+function onHexClick(panelIdx, q, r, node) {
+  if (App.isDrawingFlight) return;
+  App.customFlightBuffer = [{panelIdx, q, r}];
+  App.isDrawingFlight = true;
+}
+function onHexDblClick(panelIdx, q, r, node) {
+  if (!App.isDrawingFlight || !App.customFlightBuffer.length) return;
+  let from = App.customFlightBuffer[0];
+  if (from.panelIdx === panelIdx && from.q === q && from.r === r) return;
+  addCustomFlightLink(from, {panelIdx, q, r});
+  App.customFlightBuffer = [];
+  App.isDrawingFlight = false;
+  drawOverlayLinesFromLinks(App._lastLinks, App.allHexDataByPanel, App.hexMapsByPanel, false);
+  renderCityCircles(extractCityHexSet(App._lastLinks), App.allHexDataByPanel, App.config.city.radius);
+}
+function addCustomFlightLink(a, b) {
+  const flight = {
+    type: "flight",
+    panelIdxFrom: a.panelIdx,
+    panelIdxTo: b.panelIdx,
+    from: {q: a.q, r: a.r, panelIdx: a.panelIdx},
+    to: {q: b.q, r: b.r, panelIdx: b.panelIdx},
+    path: [
+      {q: a.q, r: a.r, panelIdx: a.panelIdx},
+      {q: b.q, r: b.r, panelIdx: b.panelIdx}
+    ]
+  };
+  App._lastLinks.push(flight);
+  drawOverlayLinesFromLinks(App._lastLinks, App.allHexDataByPanel, App.hexMapsByPanel, false);
+}
+
+// 主流程
+function renderSemanticMapFromData(data) {
+  App._lastLinks = data.links;
+  renderPanels(data.subspaces);
+  data.subspaces.forEach((space, i) => renderHexGridFromData(i, space, App.config.hex.radius));
+  drawOverlayLinesFromLinks(data.links, App.allHexDataByPanel, App.hexMapsByPanel, false);
+  renderCityCircles(extractCityHexSet(data.links), App.allHexDataByPanel, App.config.city.radius);
+  observePanelResize();
+  window.addEventListener("resize", () => {
+    data.subspaces.forEach((space, i) => renderHexGridFromData(i, space, App.config.hex.radius));
+    drawOverlayLinesFromLinks(App._lastLinks, App.allHexDataByPanel, App.hexMapsByPanel, App.isDrawingFlight);
+    renderCityCircles(extractCityHexSet(App._lastLinks), App.allHexDataByPanel, App.config.city.radius);
+    const playground = App.playground;
+    const globalOverlay = App.globalOverlay;
+    globalOverlay.setAttribute('width', playground.clientWidth);
+    globalOverlay.setAttribute('height', playground.clientHeight);
+  });
+  const playground = App.playground;
+  const globalOverlay = App.globalOverlay;
+  const resizeObserver = new ResizeObserver(() => {
+    globalOverlay.setAttribute('width', playground.clientWidth);
+    globalOverlay.setAttribute('height', playground.clientHeight);
+  });
+  resizeObserver.observe(playground);
+}
+
+// 悬浮 flight 曲线全局事件监听
+document.addEventListener("mousemove", function(event) {
+  if (App.isDrawingFlight && App.customFlightBuffer.length === 1) {
+    const playgroundRect = App.playground.getBoundingClientRect();
+    App.currentMouse.x = event.clientX - playgroundRect.left;
+    App.currentMouse.y = event.clientY - playgroundRect.top;
+    drawOverlayLinesFromLinks(App._lastLinks, App.allHexDataByPanel, App.hexMapsByPanel, true);
+  }
+});
+
+// ========================
+// 数据加载入口
+// ========================
+fetch('data/semantic_map_data.json')
+  .then(res => res.json())
+  .then(data => {
+    renderSemanticMapFromData(data);
+  });
+</script>
+</body>
+</html>

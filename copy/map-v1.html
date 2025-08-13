@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Playground Hex Cross-panel Connection</title>
+  <script src="js/d3.v7.min.js"></script>
+  <style>
+    body { margin: 0; font-family: sans-serif; background: #f4f4f4; }
+    #playground {
+      width: 1200px;
+      height: 800px;
+      margin: 40px auto;
+      display: grid;
+      gap: 24px;
+      background: #fff;
+      border: 2px solid #bbb;
+      box-shadow: 0 4px 24px #0002;
+      padding: 32px;
+      position: relative;
+    }
+    .subspace {
+      background: #fff;
+      border: 1.5px solid #aaa;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px #0001;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      justify-content: flex-start;
+    }
+    .subspace-title {
+      font-size: 14px;
+      color: #666;
+      text-align: center;
+      margin: 10px 0 4px 0;
+      pointer-events: none;
+      user-select: none;
+      position: relative;
+      z-index: 20;
+    }
+    .hex-container {
+      position: relative;
+      width: 100%; height: 92%;
+      flex: 1;
+    }
+    .hex-svg, .overlay-svg {
+      position: absolute;
+      left: 0; top: 0;
+      width: 100%; height: 100%;
+      display: block;
+      overflow: visible;
+    }
+    .overlay-svg, #global-overlay {
+      pointer-events: none;
+      z-index: 10;
+    }
+    #global-overlay {
+      position: absolute;
+      left: 0; top: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 20;
+    }
+  </style>
+</head>
+<body>
+  <div id="playground">
+    <svg id="global-overlay"></svg>
+  </div>
+<script>
+// ====== 配置与全局状态 ======
+const ColorPalette = {
+  background: "#fff",
+  text:      "#a9d08d",
+  image:     "#a6cee3",
+  selecting: "#d9d9d9",
+  selected:  "#d1d1d1",
+  countryBorder: "#000",
+  intervalBorder: "#fff",
+  road:     "#e9c46b",
+  river:    "#a6cee3",
+  flight:   "#4a5f7e",
+  cityBorder: "#777",
+  grey:    "#666"
+};
+const connectionStyle = {
+  road:   { stroke: ColorPalette.road,   width: 1.5, dash: null    },
+  river:  { stroke: ColorPalette.river,  width: 1.5, dash: null    },
+  flight: { stroke: ColorPalette.flight, width: 1.5, dash: "6,4"   }
+};
+const styleConfig = {
+  commonborder: 1,
+  citywidth: 1.5,
+  hexFillOpacity: 0.5,
+  hexRadius: 22,
+  cityRadius: 5,
+};
+let subspaceSvgs = [];
+let overlaySvgs = [];
+let hexMapsByPanel = [];
+let allHexDataByPanel = [];
+let zoomStates = [];
+
+// ====== 逻辑函数 ======
+
+function getHexFillColor(d) {
+  return d.modality === 'text' ? ColorPalette.text : ColorPalette.image;
+}
+function extractCityHexSet(links) {
+  // 返回所有需要高亮city的key
+  const citySet = {};
+  links.forEach(link => {
+    if (!link.path || link.path.length < 2) return;
+    let p = link.path[0];
+    let panelIdx = p.panelIdx ?? link.panelIdx ?? link.panelIdxFrom ?? 0;
+    citySet[`${panelIdx}_${p.q}_${p.r}`] = true;
+  });
+  return citySet;
+}
+function renderPanels(subspaces) {
+  // 动态渲染所有subspace面板结构
+  const playground = document.getElementById('playground');
+  Array.from(playground.querySelectorAll('.subspace')).forEach(el => el.remove());
+  subspaceSvgs = [];
+  overlaySvgs = [];
+  hexMapsByPanel = [];
+  allHexDataByPanel = [];
+  zoomStates = [];
+  playground.style.gridTemplateColumns = `repeat(${subspaces.length}, 1fr)`;
+  playground.style.gridTemplateRows = `1fr`;
+
+  subspaces.forEach((space, i) => {
+    const div = document.createElement('div');
+    div.className = 'subspace';
+    // Title
+    const title = document.createElement('div');
+    title.className = 'subspace-title';
+    title.innerText = space.subspaceName || `Subspace ${i+1}`;
+    div.appendChild(title);
+
+    // 容器
+    const container = document.createElement('div');
+    container.className = 'hex-container';
+
+    // 主SVG
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute('class', 'hex-svg');
+    container.appendChild(svg);
+
+    // 覆盖物SVG（城市、连线等）
+    const overlay = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    overlay.setAttribute('class', 'overlay-svg');
+    overlay.style.pointerEvents = "none";
+    overlay.style.zIndex = "10";
+    container.appendChild(overlay);
+
+    // 初始化 overlay <g>
+    const overlayD3 = d3.select(overlay);
+    if (overlayD3.select("g").empty()) overlayD3.append("g");
+
+    div.appendChild(container);
+    playground.appendChild(div);
+    subspaceSvgs.push(d3.select(svg));
+    overlaySvgs.push(overlayD3);
+  });
+}
+function renderHexGridFromData(panelIdx, space, hexRadius) {
+  const svg = subspaceSvgs[panelIdx];
+  const overlay = overlaySvgs[panelIdx];
+  const width = svg.node().clientWidth || svg.node().parentNode.clientWidth;
+  const height = svg.node().clientHeight || svg.node().parentNode.clientHeight;
+  svg.attr("width", width).attr("height", height);
+  overlay.attr("width", width).attr("height", height);
+
+  let container = svg.select("g");
+  if (container.empty()) container = svg.append("g");
+  let overlayG = overlay.select("g");
+  if (overlayG.empty()) overlayG = overlay.append("g");
+
+  // 坐标计算与居中
+  const rawHexList = (space.hexList || []).map(h => {
+    const x = 3/4 * 2 * hexRadius * h.q;
+    const y = Math.sqrt(3) * hexRadius * (h.r + h.q / 2);
+    return { ...h, rawX: x, rawY: y };
+  });
+  const xs = rawHexList.map(h => h.rawX), ys = rawHexList.map(h => h.rawY);
+  const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+  const centerX = (minX + maxX) / 2, centerY = (minY + maxY) / 2;
+  const hexList = rawHexList.map(h => ({
+    ...h,
+    x: h.rawX - centerX + width / 2,
+    y: h.rawY - centerY + height / 2,
+    panelIdx
+  }));
+  allHexDataByPanel[panelIdx] = hexList;
+
+  // Zoom（保留缩放）
+  let lastTransform = zoomStates[panelIdx] || d3.zoomIdentity;
+  const zoom = d3.zoom()
+    .scaleExtent([0.6, 2])
+    .on("zoom", (event) => {
+      container.attr("transform", event.transform);
+      overlayG.attr("transform", event.transform);
+      zoomStates[panelIdx] = event.transform;
+      drawOverlayLinesFromLinks(window._lastLinks, allHexDataByPanel, hexMapsByPanel);
+    });
+  svg.call(zoom).on("dblclick.zoom", null);
+  container.attr("transform", lastTransform);
+  overlayG.attr("transform", lastTransform);
+  svg.call(zoom.transform, lastTransform);
+
+  // Hex绘制
+  container.selectAll("g.hex")
+    .data(hexList, d => `${d.panelIdx}_${d.q}_${d.r}`)
+    .join(
+      enter => {
+        const g = enter.append("g").attr("class", "hex");
+        g.append("path")
+          .attr("d", d3.line()(hexPoints(hexRadius)))
+          .attr("fill", d => getHexFillColor(d))
+          .attr("fill-opacity", styleConfig.hexFillOpacity)
+          .attr("stroke", ColorPalette.intervalBorder)
+          .attr("stroke-width", styleConfig.commonborder);
+        return g.attr("transform", d => `translate(${d.x},${d.y})`);
+      },
+      update => update.attr("transform", d => `translate(${d.x},${d.y})`),
+      exit => exit.remove()
+    );
+
+  // country边界
+  container.selectAll(".country-border").remove();
+  (space.countries || []).forEach(country => {
+    let hexListCountry = [];
+    container.selectAll("g.hex").each(function(d) {
+      if (country.hexes.some(hx => hx.q === d.q && hx.r === d.r)) {
+        hexListCountry.push({...d});
+      }
+    });
+    if (hexListCountry.length > 0) {
+      drawCountryBorder(hexListCountry, svg, styleConfig.hexRadius, ColorPalette.background, ColorPalette.selected);
+    }
+  });
+
+  // hexMap
+  let hexMap = new Map();
+  hexList.forEach(d => hexMap.set(`${d.q},${d.r}`, d));
+  hexMapsByPanel[panelIdx] = hexMap;
+}
+function renderCityCircles(cityHexSet, allHexDataByPanel, cityRadius) {
+  overlaySvgs.forEach((overlaySvg, panelIdx) => {
+    const g = overlaySvg.select("g");
+    let cityHexes = allHexDataByPanel[panelIdx]?.filter(
+      h => cityHexSet[`${panelIdx}_${h.q}_${h.r}`]
+    ) || [];
+    const circles = g.selectAll("circle.city-circle")
+      .data(cityHexes, d => `${d.q},${d.r}`);
+    circles.enter()
+      .append("circle")
+      .attr("class", "city-circle")
+      .attr("cx", d => d.x)
+      .attr("cy", d => d.y)
+      .attr("r", cityRadius)
+      .attr("fill", ColorPalette.background)
+      .attr("stroke", ColorPalette.cityBorder)
+      .attr("stroke-width", styleConfig.citywidth)
+      .style("pointer-events", "auto");
+    circles
+      .attr("cx", d => d.x)
+      .attr("cy", d => d.y)
+      .attr("r", cityRadius);
+    circles.exit().remove();
+    g.selectAll("circle.city-circle").raise();
+  });
+}
+function drawOverlayLinesFromLinks(links, allHexDataByPanel, hexMapsByPanel) {
+  overlaySvgs.forEach(overlaySvg => overlaySvg.select("g").selectAll("polyline, line").remove());
+  d3.select("#global-overlay").selectAll("polyline, line").remove();
+
+  links.forEach(link => {
+    const style = connectionStyle[link.type];
+    // flight（跨panel）
+    if (link.type === "flight") {
+      const points = link.path.map((p, i) => {
+        let panelIdx = p.panelIdx ?? (i === 0 ? link.panelIdxFrom : link.panelIdxTo) ?? link.panelIdx ?? 0;
+        return getHexGlobalXY(panelIdx, p.q, p.r);
+      }).filter(Boolean);
+      if (points.length === 2) {
+        const fromPanelIdx = link.path[0].panelIdx ?? link.panelIdxFrom ?? link.panelIdx ?? 0;
+        const toPanelIdx = link.path[1].panelIdx ?? link.panelIdxTo ?? link.panelIdx ?? 0;
+        const fromRect = getPanelRect(fromPanelIdx);
+        const toRect = getPanelRect(toPanelIdx);
+        if (
+          pointInRect(points[0][0], points[0][1], fromRect) &&
+          pointInRect(points[1][0], points[1][1], toRect)
+        ) {
+          d3.select("#global-overlay").append("line")
+            .attr("x1", points[0][0])
+            .attr("y1", points[0][1])
+            .attr("x2", points[1][0])
+            .attr("y2", points[1][1])
+            .attr("stroke", style.stroke)
+            .attr("stroke-width", style.width)
+            .attr("stroke-opacity", 0.98)
+            .attr("fill", "none")
+            .attr("stroke-dasharray", style.dash || null);
+        }
+      } else if (points.length > 2) {
+        d3.select("#global-overlay").append("polyline")
+          .attr("points", points.map(p => p.join(",")).join(" "))
+          .attr("stroke", style.stroke)
+          .attr("stroke-width", style.width)
+          .attr("stroke-opacity", 0.98)
+          .attr("fill", "none")
+          .attr("stroke-dasharray", style.dash || null);
+      }
+      return;
+    }
+    // panel内部的线（road/river等）
+    let panelIdx = link.panelIdx ?? (link.path && link.path[0].panelIdx) ?? 0;
+    const overlaySvg = overlaySvgs[panelIdx];
+    const g = overlaySvg.select("g");
+    const hexMap = hexMapsByPanel[panelIdx];
+    const points = link.path.map(p => {
+      let hex = hexMap && hexMap.get(`${p.q},${p.r}`);
+      return hex ? [hex.x, hex.y] : null;
+    }).filter(Boolean);
+    if (points.length < 2) return;
+    if (points.length === 2) {
+      g.append("line")
+        .attr("x1", points[0][0])
+        .attr("y1", points[0][1])
+        .attr("x2", points[1][0])
+        .attr("y2", points[1][1])
+        .attr("stroke", style.stroke)
+        .attr("stroke-width", style.width)
+        .attr("stroke-opacity", 0.88)
+        .attr("fill", "none")
+        .attr("stroke-dasharray", style.dash || null);
+    } else {
+      g.append("polyline")
+        .attr("points", points.map(p => p.join(",")).join(" "))
+        .attr("stroke", style.stroke)
+        .attr("stroke-width", style.width)
+        .attr("stroke-opacity", 0.88)
+        .attr("fill", "none")
+        .attr("stroke-dasharray", style.dash || null);
+    }
+  });
+
+  // city圈raise
+  overlaySvgs.forEach(overlaySvg => {
+    const g = overlaySvg.select("g");
+    g.selectAll("circle.city-circle").raise();
+  });
+}
+function drawCountryBorder(hexList, svg, hexRadius, color, strokeWidth) {
+  // country边界
+  const keySet = new Set(hexList.map(h => `${h.panelIdx}_${h.q}_${h.r}`));
+  const dirs = [
+    [+1,  0], [0, +1], [-1, +1],
+    [-1,  0], [0, -1], [+1, -1]
+  ];
+  const hexPoint = i => {
+    const angle = Math.PI/3 * i;
+    return [hexRadius * Math.cos(angle), hexRadius * Math.sin(angle)];
+  };
+  let borderEdges = [];
+  hexList.forEach(h => {
+    const cx = h.x, cy = h.y;
+    dirs.forEach(([dq, dr], i) => {
+      const nKey = `${h.panelIdx}_${h.q+dq}_${h.r+dr}`;
+      if (!keySet.has(nKey)) {
+        const p1 = hexPoint(i);
+        const p2 = hexPoint((i+1)%6);
+        borderEdges.push([[cx+p1[0], cy+p1[1]], [cx+p2[0], cy+p2[1]]]);
+      }
+    });
+  });
+  const edgeKey = (a, b) => a[0]+','+a[1]+'_'+b[0]+','+b[1];
+  const uniq = {};
+  borderEdges.forEach(([a,b]) => {
+    const k1 = edgeKey(a,b), k2 = edgeKey(b,a);
+    if (!uniq[k1] && !uniq[k2]) uniq[k1]=[a,b];
+  });
+  const container = svg.select("g");
+  Object.values(uniq).forEach(([a,b]) => {
+    container.append("line")
+      .attr("class", "country-border")
+      .attr("x1", a[0]).attr("y1", a[1])
+      .attr("x2", b[0]).attr("y2", b[1])
+      .attr("stroke", "#000")
+      .attr("stroke-width", 2)
+      .attr("pointer-events", "none");
+  });
+}
+function hexPoints(radius) {
+  const angle = Math.PI / 3;
+  return d3.range(6).map(i => [
+    radius * Math.cos(angle * i),
+    radius * Math.sin(angle * i)
+  ]).concat([[radius, 0]]);
+}
+function getPanelRect(panelIdx) {
+  const panelDom = document.querySelectorAll('.subspace')[panelIdx];
+  if (!panelDom) return null;
+  const container = panelDom.querySelector('.hex-container');
+  if (!container) return null;
+  const playgroundRect = document.getElementById('playground').getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  return {
+    left: containerRect.left - playgroundRect.left,
+    top: containerRect.top - playgroundRect.top,
+    right: containerRect.right - playgroundRect.left,
+    bottom: containerRect.bottom - playgroundRect.top
+  };
+}
+function pointInRect(x, y, rect) {
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+function getHexGlobalXY(panelIdx, q, r) {
+  const hexMap = hexMapsByPanel[panelIdx];
+  if (!hexMap) return null;
+  const hex = hexMap.get(`${q},${r}`);
+  if (!hex) return null;
+  const panelDom = document.querySelectorAll('.subspace')[panelIdx];
+  const container = panelDom.querySelector('.hex-container');
+  const playgroundRect = document.getElementById('playground').getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  const offsetX = containerRect.left - playgroundRect.left;
+  const offsetY = containerRect.top - playgroundRect.top;
+  const t = zoomStates[panelIdx] || d3.zoomIdentity;
+  const [tx, ty] = [t.applyX(hex.x), t.applyY(hex.y)];
+  return [tx + offsetX, ty + offsetY];
+}
+
+// ==== 主渲染流程 ====
+function renderSemanticMapFromData(data) {
+  window._lastLinks = data.links;
+  renderPanels(data.subspaces);
+  data.subspaces.forEach((space, i) => renderHexGridFromData(i, space, styleConfig.hexRadius));
+  drawOverlayLinesFromLinks(data.links, allHexDataByPanel, hexMapsByPanel);
+  const cityHexSet = extractCityHexSet(data.links);
+  renderCityCircles(cityHexSet, allHexDataByPanel, styleConfig.cityRadius);
+
+  window.addEventListener("resize", () => {
+    data.subspaces.forEach((space, i) => renderHexGridFromData(i, space, styleConfig.hexRadius));
+    drawOverlayLinesFromLinks(data.links, allHexDataByPanel, hexMapsByPanel);
+    renderCityCircles(cityHexSet, allHexDataByPanel, styleConfig.cityRadius);
+    // 全局 overlay 大小
+    const playground = document.getElementById('playground');
+    const globalOverlay = document.getElementById('global-overlay');
+    globalOverlay.setAttribute('width', playground.clientWidth);
+    globalOverlay.setAttribute('height', playground.clientHeight);
+  });
+
+  // 初始化时全局 overlay 大小
+  const playground = document.getElementById('playground');
+  const globalOverlay = document.getElementById('global-overlay');
+  globalOverlay.setAttribute('width', playground.clientWidth);
+  globalOverlay.setAttribute('height', playground.clientHeight);
+}
+
+// === 启动 ===
+fetch('data/semantic_map_data.json')
+  .then(res => res.json())
+  .then(data => {
+    renderSemanticMapFromData(data);
+  });
+</script>
+</body>
+</html>

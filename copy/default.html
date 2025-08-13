@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Playground Hex Cross-panel Connection</title>
+  <script src="js/d3.v7.min.js"></script>
+  <style>
+    body { margin: 0; font-family: sans-serif; background: #f4f4f4; }
+    #playground {
+      width: 1200px;
+      height: 800px;
+      margin: 40px auto;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      grid-template-rows: repeat(2, 1fr);
+      gap: 24px;
+      background: #fff;
+      border: 2px solid #bbb;
+      box-shadow: 0 4px 24px #0002;
+      padding: 32px;
+      position: relative;
+    }
+    #overlay {
+      position: absolute;
+      left: 0; top: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 10;
+    }
+    .subspace {
+      background: #fff;
+      border: 1.5px solid #aaa;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px #0001;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+    .subspace-title {
+      font-size: 14px;
+      color: #666;
+      text-align: center;
+      margin-top: 10px;
+      margin-bottom: 4px;
+      pointer-events: none;
+      user-select: none;
+    }
+    .hex { cursor: pointer; pointer-events: all; }
+    .label { font-size: 10px; text-anchor: middle; alignment-baseline: middle; pointer-events: none; }
+    svg { width: 100%; height: 92%; display: block; }
+    #overlay { pointer-events: none; }
+  </style>
+</head>
+<body>
+  <div id="playground">
+    <svg id="overlay"></svg>
+    <div class="subspace"><div class="subspace-title">Subspace 1</div><svg></svg></div>
+    <div class="subspace"><div class="subspace-title">Subspace 2</div><svg></svg></div>
+    <div class="subspace"><div class="subspace-title">Subspace 3</div><svg></svg></div>
+    <div class="subspace"><div class="subspace-title">Subspace 4</div><svg></svg></div>
+    <div class="subspace"><div class="subspace-title">Subspace 5</div><svg></svg></div>
+    <div class="subspace"><div class="subspace-title">Subspace 6</div><svg></svg></div>
+  </div>
+
+<script>
+  // ====== 颜色&样式统一设置 ======
+  const ColorPalette = {
+    background: "#fff",
+    text:      "#a9d08d",
+    image:     "#a6cee3",
+    selecting: "#d9d9d9",
+    selected:  "#d1d1d1",
+    countryBorder: "#000",
+    road:     "#e9c46b",
+    river:    "#a6cee3",
+    flight:   "#f3a261",
+    grey:    "#666"
+  };
+  let spaceSytleSetting = {
+    commonborder: 1,
+    highlightborder: 1.5,
+    linkwidth: 1.8,
+  };
+
+  const connectionStyle = {
+    road:   { stroke: ColorPalette.road,   width: 2, dash: null    },
+    river:  { stroke: ColorPalette.river,  width: 2, dash: null    },
+    flight: { stroke: ColorPalette.flight, width: 2, dash: "6,4"   }
+  };
+
+  // ===== 全局变量 =====
+  let selectedHexes = [];     // 所有已高亮节点
+  let connections = [];       // {a, b}
+  let clickBuffer = [];       // 临时连线端点缓存（长度2）
+  let countryGroups = [];     // 每panel的country
+  const hexDirections = [
+    [+1,  0], [0, +1], [-1, +1],
+    [-1,  0], [0, -1], [+1, -1]
+  ];
+
+  function getHexFillColor(d) {
+    // d 必须有 q, r, panelIdx, modality
+    let isCountryHex = false;
+    let m = null;
+    if (countryGroups[d.panelIdx]) {
+      for (const group of countryGroups[d.panelIdx]) {
+        for (const hex of group) {
+          if (hex.q === d.q && hex.r === d.r) {
+            isCountryHex = true;
+            m = hex.modality;
+            break;
+          }
+        }
+        if (isCountryHex) break;
+      }
+    }
+    if (isCountryHex) {
+      return m === 'text' ? ColorPalette.text : ColorPalette.image;
+    }
+    return ColorPalette.background;
+  }
+
+  // ===== 六边形网格BFS最短路径 =====
+  function findHexPathInCountry(countryHexSet, q1, r1, q2, r2) {
+    const start = `${q1},${r1}`, end = `${q2},${r2}`;
+    if (start === end) return [start];
+    let queue = [[start]];
+    let visited = new Set([start]);
+    while (queue.length) {
+      const path = queue.shift();
+      const [cq, cr] = path[path.length-1].split(',').map(Number);
+      for (const [dq, dr] of hexDirections) {
+        const nq = cq + dq, nr = cr + dr, nkey = `${nq},${nr}`;
+        if (!countryHexSet.has(nkey) || visited.has(nkey)) continue;
+        const newPath = [...path, nkey];
+        if (nkey === end) return newPath;
+        queue.push(newPath);
+        visited.add(nkey);
+      }
+    }
+    return null; // unreachable
+  }
+
+  // ===== 获取overlay像素坐标 =====
+  function getHexOverlayPosition(svg, d) {
+    const playgroundRect = document.getElementById('playground').getBoundingClientRect();
+    const svgRect = svg.node().getBoundingClientRect();
+    const t = d3.zoomTransform(svg.node());
+    const [cx, cy] = [d.x, d.y];
+    const svgX = t.applyX(cx);
+    const svgY = t.applyY(cy);
+    return [
+      svgRect.left - playgroundRect.left + svgX,
+      svgRect.top - playgroundRect.top + svgY
+    ];
+  }
+
+  // ===== 连线渲染：country内polyline, country外虚线 =====
+function drawOverlayLines() {
+  function getConnectionType(a, b) {
+    if (a.d.modality === 'text' && b.d.modality === 'text') {
+      return 'road';   // 文本-文本，道路
+    }
+    if (a.d.modality === 'image' && b.d.modality === 'image') {
+      return 'river';  // 图像-图像，河流
+    }
+    return 'flight';   // 跨模态，航线
+  }
+
+  const overlaySvg = d3.select("#overlay");
+  overlaySvg.selectAll("line").remove();
+  overlaySvg.selectAll("polyline").remove();
+
+  for (const conn of connections) {
+    const h1 = conn.a, h2 = conn.b;
+    const set1 = h1.svg.node().__hexMap__;
+    const set2 = h2.svg.node().__hexMap__;
+    const key1 = `${h1.d.q},${h1.d.r},${h1.d.panelIdx}`;
+    const key2 = `${h2.d.q},${h2.d.r},${h2.d.panelIdx}`;
+    if (!set1 || !set2 || !set1.has(key1) || !set2.has(key2)) continue;
+
+    // 判断是否同一 country
+    const panelCountries = countryGroups[h1.d.panelIdx] || [];
+    let found = null;
+    for (const group of panelCountries) {
+      const countrySet = new Set(group.map(h => `${h.panelIdx}_${h.q}_${h.r}`));
+      if (
+        countrySet.has(`${h1.d.panelIdx}_${h1.d.q}_${h1.d.r}`) &&
+        countrySet.has(`${h2.d.panelIdx}_${h2.d.q}_${h2.d.r}`)
+      ) {
+        found = new Set(group.map(h => `${h.q},${h.r}`));
+        break;
+      }
+    }
+    // 获取本条连线的类型与样式
+    const ctype = getConnectionType(h1, h2);
+    const style = connectionStyle[ctype];
+
+    if (found) {
+      // 在同一country，polyline
+      const pathKeys = findHexPathInCountry(
+        found, h1.d.q, h1.d.r, h2.d.q, h2.d.r
+      );
+      if (pathKeys) {
+        const points = pathKeys.map(key => {
+          const [q, r] = key.split(',').map(Number);
+          const panelSvg = h1.svg;
+          let d = null;
+          panelSvg.selectAll("g.hex").each(function(data) {
+            if (data.q === q && data.r === r && data.panelIdx === h1.d.panelIdx)
+              d = data;
+          });
+          return getHexOverlayPosition(panelSvg, d);
+        });
+        const pline = overlaySvg.append("polyline")
+          .attr("points", points.map(p => p.join(",")).join(" "))
+          .attr("stroke", style.stroke)
+          .attr("stroke-width", style.width)
+          .attr("stroke-opacity", 0.8)
+          .attr("fill", "none");
+        if (style.dash) pline.attr("stroke-dasharray", style.dash);
+      }
+    } else {
+      // country外，直线
+      const [x1, y1] = getHexOverlayPosition(h1.svg, h1.d);
+      const [x2, y2] = getHexOverlayPosition(h2.svg, h2.d);
+      const line = overlaySvg.append("line")
+        .attr("x1", x1).attr("y1", y1)
+        .attr("x2", x2).attr("y2", y2)
+        .attr("stroke", style.stroke)
+        .attr("stroke-width", style.width)
+        .attr("stroke-opacity", 0.8);
+      if (style.dash) line.attr("stroke-dasharray", style.dash);
+    }
+  }
+}
+
+function hexEqual(a, b) {
+  return a.svg.node() === b.svg.node()
+    && a.d.q === b.d.q && a.d.r === b.d.r
+    && a.d.panelIdx === b.d.panelIdx;
+}
+
+function connHasHex(conn, hex) {
+  return hexEqual(conn.a, hex) || hexEqual(conn.b, hex);
+}
+
+function alreadyConnected(a, b) {
+  return connections.some(conn =>
+    (hexEqual(conn.a, a) && hexEqual(conn.b, b)) ||
+    (hexEqual(conn.a, b) && hexEqual(conn.b, a))
+  );
+}
+
+function handleHexClick(svg, d, gThis) {
+  const hexObj = {svg, d, gNode: gThis};
+  const idx = selectedHexes.findIndex(h => hexEqual(h, hexObj));
+
+  if (idx === -1) {
+    // 未高亮：加高亮、加到selectedHexes
+    selectedHexes.push(hexObj);
+    d3.select(gThis).classed("selected", true);
+    d3.select(gThis).select("path").attr("fill", ColorPalette.selected);
+
+    // 添加到clickBuffer（只允许高亮点）
+    clickBuffer.push(hexObj);
+    if (clickBuffer.length > 2) clickBuffer.shift();
+
+  } else {
+    // 已高亮：取消高亮、移除selectedHexes
+    selectedHexes.splice(idx, 1);
+    d3.select(gThis).classed("selected", false);
+    d3.select(gThis).select("path").attr("fill", getHexFillColor(d));
+
+    // 删除相关连线
+    connections = connections.filter(conn => !connHasHex(conn, hexObj));
+    drawOverlayLines();
+
+    // 从clickBuffer里移除该点
+    clickBuffer = clickBuffer.filter(h => !hexEqual(h, hexObj));
+  }
+
+  // 保证clickBuffer只含当前高亮的点（最多2个）
+  clickBuffer = clickBuffer.filter(
+    h => selectedHexes.some(sel => hexEqual(h, sel))
+  );
+
+  // 只有两个高亮点时才连线
+  if (clickBuffer.length === 2) {
+    const [a, b] = clickBuffer;
+    if (!alreadyConnected(a, b)) {
+      connections.push({a, b});
+      drawOverlayLines();
+    }
+    // 连线后清空缓冲
+    clickBuffer = [];
+  }
+}
+
+function randomCountryGroupsForPanel(panelIdx, hexRadius) {
+  function randomInt(a, b) { return a + Math.floor(Math.random() * (b - a + 1)); }
+  const numCountries = randomInt(2, 3);
+  let allUsed = new Set();
+  let countries = [];
+  for (let k = 0; k < numCountries; k++) {
+    let size = randomInt(5, 8); // 适当增大size
+    let q = randomInt(-2, 2), r = randomInt(-2, 2); // 起点更靠近中心
+    let group = [];
+    let visited = new Set();
+    let queue = [`${q},${r}`];
+    while (group.length < size && queue.length) {
+      let [cq, cr] = queue.shift().split(',').map(Number);
+      const key = `${cq},${cr}`;
+      if (visited.has(key) || allUsed.has(key)) continue;
+      // === 随机分配模态（50%概率，或可调整比例） ===
+      const modality = Math.random() > 0.5 ? 'text' : 'image';
+      group.push({panelIdx, q: cq, r: cr, modality});
+      visited.add(key); allUsed.add(key);
+      [[1,0],[0,1],[-1,1],[-1,0],[0,-1],[1,-1]].forEach(([dq, dr]) => {
+        const nq = cq + dq, nr = cr + dr;
+        const nkey = `${nq},${nr}`;
+        if (!visited.has(nkey) && !allUsed.has(nkey) && Math.abs(nq) <= 7 && Math.abs(nr) <= 7) {
+          queue.push(nkey);
+        }
+      });
+    }
+    countries.push(group);
+  }
+  return countries;
+}
+
+function drawCountryBorder(hexList, svg, hexRadius, color, strokeWidth) {
+  const keySet = new Set(hexList.map(h => `${h.panelIdx}_${h.q}_${h.r}`));
+  const dirs = [
+    [+1,  0], [0, +1], [-1, +1],
+    [-1,  0], [0, -1], [+1, -1]
+  ];
+  const hexPoint = i => {
+    const angle = Math.PI/3 * i;
+    return [hexRadius * Math.cos(angle), hexRadius * Math.sin(angle)];
+  };
+  let borderEdges = [];
+  hexList.forEach(h => {
+    const cx = h.x, cy = h.y;
+    dirs.forEach(([dq, dr], i) => {
+      const nKey = `${h.panelIdx}_${h.q+dq}_${h.r+dr}`;
+      if (!keySet.has(nKey)) {
+        const p1 = hexPoint(i);
+        const p2 = hexPoint((i+1)%6);
+        borderEdges.push([[cx+p1[0], cy+p1[1]], [cx+p2[0], cy+p2[1]]]);
+      }
+    });
+  });
+  const edgeKey = (a, b) => a[0]+','+a[1]+'_'+b[0]+','+b[1];
+  const uniq = {};
+  borderEdges.forEach(([a,b]) => {
+    const k1 = edgeKey(a,b), k2 = edgeKey(b,a);
+    if (!uniq[k1] && !uniq[k2]) uniq[k1]=[a,b];
+  });
+  const container = svg.select("g");
+  Object.values(uniq).forEach(([a,b]) => {
+    container.append("line")
+      .attr("class", "country-border")
+      .attr("x1", a[0]).attr("y1", a[1])
+      .attr("x2", b[0]).attr("y2", b[1])
+      .attr("stroke", ColorPalette.countryBorder)
+      .attr("stroke-width", strokeWidth)
+      .attr("pointer-events", "none");
+  });
+}
+
+function renderHexGrid(svg, width, height, hexRadius, panelIdx) {
+  const hexHeight = Math.sqrt(3) * hexRadius;
+  const hexWidth = 2 * hexRadius;
+  const vertSpacing = hexHeight;
+  const horizSpacing = 3 / 4 * hexWidth;
+  let container = svg.select("g");
+  if (container.empty()) {
+    container = svg.append("g");
+  }
+  // 保留container，不每次重建
+  function hexPoints(radius) {
+    const angle = Math.PI / 3;
+    return d3.range(6).map(i => [
+      radius * Math.cos(angle * i),
+      radius * Math.sin(angle * i)
+    ]).concat([[radius, 0]]);
+  }
+
+  // ======= 计算 hexData =======
+  const qMin = -7, qMax = 7, rMin = -7, rMax = 7; // 简化范围
+  let hexData = [];
+  const groupHexSet = new Map();
+  if (countryGroups[panelIdx]) {
+    for (const group of countryGroups[panelIdx]) {
+      for (const hex of group) {
+        groupHexSet.set(`${hex.q},${hex.r}`, hex.modality);
+      }
+    }
+  }
+  for (let q = qMin; q <= qMax; q++) {
+    for (let r = rMin; r <= rMax; r++) {
+      const x = horizSpacing * q;
+      const y = vertSpacing * (r + q / 2);
+      if (
+        x + hexWidth / 2 > -hexWidth &&
+        x - hexWidth / 2 < width + hexWidth &&
+        y + hexHeight / 2 > -hexHeight &&
+        y - hexHeight / 2 < height + hexHeight
+      ) {
+        let modality = groupHexSet.get(`${q},${r}`) || 'text';
+        hexData.push({
+          q, r,
+          name: `S${q},${r}`,
+          x, y,
+          panelIdx,
+          modality
+        });
+      }
+    }
+  }
+  svg.node().__hexMap__ = new Set(hexData.map(d => `${d.q},${d.r},${d.panelIdx}`));
+
+  // ========= 数据绑定与事件绑定 ==========
+  const hexes = container.selectAll("g.hex")
+    .data(hexData, d => `${d.panelIdx}_${d.q}_${d.r}`)
+    .join(
+      enter => {
+        const g = enter.append("g").attr("class", "hex");
+        g.append("path")
+          .attr("d", d3.line()(hexPoints(hexRadius)))
+          .attr("fill", d => {
+            let isCountryHex = false;
+            let m = null;
+            if (countryGroups[d.panelIdx]) {
+              for (const group of countryGroups[d.panelIdx]) {
+                for (const hex of group) {
+                  if (hex.q === d.q && hex.r === d.r) {
+                    isCountryHex = true;
+                    m = hex.modality;
+                    break;
+                  }
+                }
+                if (isCountryHex) break;
+              }
+            }
+            if (isCountryHex) {
+              return m === 'text' ? ColorPalette.text : ColorPalette.image;
+            }
+            return ColorPalette.background;
+          })
+          .attr("stroke", "#fff")
+          .attr("stroke-width", spaceSytleSetting.commonborder)
+          .on("mouseover", function(event, d) {
+            if (!d3.select(this.parentNode).classed("selected")) {
+              d3.select(this).attr("fill", ColorPalette.selecting);
+            }
+          })
+          .on("mouseout", function(event, d) {
+            let isCountryHex = false;
+            let m = null;
+            if (countryGroups[d.panelIdx]) {
+              for (const group of countryGroups[d.panelIdx]) {
+                for (const hex of group) {
+                  if (hex.q === d.q && hex.r === d.r) {
+                    isCountryHex = true;
+                    m = hex.modality;
+                    break;
+                  }
+                }
+                if (isCountryHex) break;
+              }
+            }
+            if (!d3.select(this.parentNode).classed("selected")) {
+              d3.select(this).attr("fill", getHexFillColor(d));
+            }
+          });
+        // 事件绑定始终存在
+        g.on("click", function(event, d) {
+          event.stopPropagation();
+          handleHexClick(svg, d, this);
+        });
+        return g;
+      },
+      update => update,
+      exit => exit.remove()
+    )
+    .attr("transform", d => `translate(${d.x},${d.y})`);
+
+  // 保持交互高亮
+  hexes.each(function(d) {
+    const isSelected = selectedHexes.some(h =>
+        h.svg.node() === svg.node() && h.d.q === d.q && h.d.r === d.r && h.d.panelIdx === d.panelIdx
+    );
+    if (isSelected) {
+        d3.select(this).classed("selected", true);
+        d3.select(this).select("path").attr("fill", ColorPalette.selected);
+    } else {
+        d3.select(this).classed("selected", false);
+        d3.select(this).select("path").attr("fill", getHexFillColor(d));
+    }
+  });
+
+  // country 边界
+  container.selectAll(".country-border").remove();
+  if (countryGroups[panelIdx]) {
+    countryGroups[panelIdx].forEach(groupIds => {
+      let hexList = [];
+      container.selectAll("g.hex").each(function(d) {
+        if (groupIds.some(h => h.q === d.q && h.r === d.r && h.panelIdx === d.panelIdx)) {
+          hexList.push({...d});
+        }
+      });
+      if (hexList.length > 0) {
+        drawCountryBorder(hexList, svg, hexRadius, ColorPalette.background, ColorPalette.selected);
+      }
+    });
+  }
+}
+
+function setupPanel(svgEl, i) {
+  const parent = svgEl.parentNode;
+  const width = parent.clientWidth;
+  const height = parent.clientHeight * 0.88;
+  d3.select(svgEl).attr("width", width).attr("height", height);
+  renderHexGrid(d3.select(svgEl), width, height, 22, i);
+
+  // 缩放只平移变换，不销毁hex节点
+  const svg = d3.select(svgEl);
+  let container = svg.select("g");
+  if (container.empty()) container = svg.append("g");
+  const zoom = d3.zoom()
+    .scaleExtent([0.6, 2])
+    .on("zoom", (event) => {
+      container.attr("transform", event.transform);
+      drawOverlayLines();
+    });
+  svg.call(zoom)
+    .on("dblclick.zoom", null);
+  const initialTransform = d3.zoomIdentity.translate(width / 2, height / 2);
+  svg.call(zoom.transform, initialTransform);
+}
+
+// ==== 初始化countryGroups，只做一次 ====
+const subspaceCount = document.querySelectorAll('.subspace svg').length;
+countryGroups = [];
+for (let i = 0; i < subspaceCount; i++) {
+  countryGroups.push(randomCountryGroupsForPanel(i, 22));
+}
+
+// ==== 渲染所有 subspace ====
+document.querySelectorAll(".subspace svg").forEach((svgEl, i) => {
+  setupPanel(svgEl, i);
+});
+
+// ==== 窗口变化重绘overlay ====
+window.addEventListener("resize", () => {
+  drawOverlayLines();
+});
+</script>
+</body>
+</html>
